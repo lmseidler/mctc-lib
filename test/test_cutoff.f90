@@ -13,13 +13,14 @@
 ! limitations under the License.
 
 module test_cutoff
-   use mctc_cutoff, only : get_lattice_points, get_periodic_axes, reduce_basis, &
-      & wrap_to_central_cell
+   use mctc_cutoff, only : get_inverse_metric, get_lattice_points, &
+      & get_periodic_axes, get_wrapped_lattice_points, reduce_basis, &
+      & wrap_displacement, wrap_structure, wrap_to_central_cell
    use mctc_env, only : wp
    use mctc_env_testing, only : new_unittest, unittest_type, error_type, &
       & check, test_failed
-   use mctc_io_math, only : matdet_3x3
-   use mctc_io_structure, only : structure_type
+   use mctc_io_math, only : matdet_3x3, matinv_3x3
+   use mctc_io_structure, only : structure_type, new
    use testsuite_structure, only : get_structure
    implicit none
    private
@@ -44,8 +45,13 @@ subroutine collect_cutoff(testsuite)
       & new_unittest("lattice-points-errors", test_lattice_points_errors), &
       & new_unittest("lattice-points-partial-pbc", test_lattice_points_partial_pbc), &
       & new_unittest("lattice-points-rep", test_lattice_points_rep), &
+      & new_unittest("wrapped-lattice-points", test_wrapped_lattice_points), &
+      & new_unittest("wrapped-lattice-points-errors", test_wrapped_lattice_points_errors), &
       & new_unittest("wrap", test_wrap), &
+      & new_unittest("wrap-boundary", test_wrap_boundary), &
       & new_unittest("wrap-partial-pbc", test_wrap_partial_pbc), &
+      & new_unittest("wrap-displacement", test_wrap_displacement), &
+      & new_unittest("wrap-structure", test_wrap_structure), &
       & new_unittest("periodic-axes", test_periodic_axes), &
       & new_unittest("reduce-basis", test_reduce_basis) &
       & ]
@@ -432,6 +438,41 @@ subroutine test_wrap(error)
 end subroutine test_wrap
 
 
+!> Wrapping handles fractional coordinates near integer cell boundaries
+subroutine test_wrap_boundary(error)
+
+   !> Error handling
+   type(error_type), allocatable, intent(out) :: error
+
+   real(wp), parameter :: lat(3, 3) = reshape([ &
+      & 10.0_wp,  0.0_wp,  0.0_wp, &
+      &  0.0_wp, 10.0_wp,  0.0_wp, &
+      &  0.0_wp,  0.0_wp, 10.0_wp], [3, 3])
+   real(wp) :: xyz(3, 5), ref(3, 5)
+
+   ! Fractional coordinates near 0, 1, 2, and -1 boundaries
+   xyz(:, 1) = matmul(lat, [2.0_wp - 5.0e-15_wp, 1.0_wp, -1.0_wp])
+   ref(:, 1) = matmul(lat, [-5.0e-15_wp, 0.0_wp, 0.0_wp])
+
+   xyz(:, 2) = matmul(lat, [-5.0e-15_wp, -1.0e-16_wp, 0.0_wp])
+   ref(:, 2) = matmul(lat, [-5.0e-15_wp, 0.0_wp, 0.0_wp])
+
+   xyz(:, 3) = matmul(lat, [1.0_wp - 5.0e-15_wp, 3.0_wp - 1.0e-15_wp, -2.0_wp - 5.0e-15_wp])
+   ref(:, 3) = matmul(lat, [-5.0e-15_wp, -1.0e-15_wp, -5.0e-15_wp])
+
+   xyz(:, 4) = matmul(lat, [0.5_wp, 1.5_wp, -0.5_wp])
+   ref(:, 4) = matmul(lat, [0.5_wp, 0.5_wp, 0.5_wp])
+
+   xyz(:, 5) = matmul(lat, [1.0_wp - 1.0e-12_wp, -1.0e-12_wp, 2.0_wp + 1.0e-12_wp])
+   ref(:, 5) = matmul(lat, [1.0_wp - 1.0e-12_wp, 1.0_wp - 1.0e-12_wp, 1.0e-12_wp])
+
+   call wrap_to_central_cell(xyz, lat, [.true., .true., .true.])
+   call check(error, maxval(abs(xyz - ref)) <= thr, &
+      & "Boundary fractional coordinates not wrapped consistently")
+
+end subroutine test_wrap_boundary
+
+
 !> Wrapping into a skewed slab only shifts by the periodic lattice vectors
 subroutine test_wrap_partial_pbc(error)
 
@@ -459,9 +500,342 @@ subroutine test_wrap_partial_pbc(error)
 
    if (maxval(abs(xyz - xyz_ref)) > thr) then
       call test_failed(error, "Slab coordinates not wrapped into the central cell")
+      return
    end if
 
+   ! Wire along axis 2: only axis 2 wraps, nonperiodic lattice vectors ignored
+   lat = 0.0_wp
+   lat(:, 1) = [77.0_wp, -33.0_wp, 11.0_wp]
+   lat(:, 2) = a1
+   lat(:, 3) = [-19.0_wp, 88.0_wp, 42.0_wp]
+   xyz(:, 1) = 0.25_wp * a1 + 3.5_wp * normal
+   xyz(:, 2) = 0.80_wp * a1 - 2.2_wp * normal
+   xyz(:, 3) = 0.05_wp * a1 + 1.1_wp * normal
+   xyz(:, 1) = xyz(:, 1) + 4.0_wp * a1
+   xyz(:, 2) = xyz(:, 2) - 3.0_wp * a1
+   xyz(:, 3) = xyz(:, 3) + 1.0_wp * a1
+   call wrap_to_central_cell(xyz, lat, [.false., .true., .false.])
+
+   call check(error, maxval(abs(xyz(:, 1) - (0.25_wp * a1 + 3.5_wp * normal))) <= thr &
+      & .and. maxval(abs(xyz(:, 2) - (0.80_wp * a1 - 2.2_wp * normal))) <= thr &
+      & .and. maxval(abs(xyz(:, 3) - (0.05_wp * a1 + 1.1_wp * normal))) <= thr, &
+      & "Wire coordinates not wrapped along periodic axis only")
+   if (allocated(error)) return
+
+   ! Molecular (0D) coordinates remain unchanged
+   xyz = xyz_ref + 20.0_wp
+   call wrap_to_central_cell(xyz, lat, [.false., .false., .false.])
+   call check(error, maxval(abs(xyz - (xyz_ref + 20.0_wp))) <= thr, &
+      & "Nonperiodic coordinates modified by wrap_to_central_cell")
+
 end subroutine test_wrap_partial_pbc
+
+
+!> Fold displacements into fractional [-0.5, 0.5] along periodic axes only
+subroutine test_wrap_displacement(error)
+
+   !> Error handling
+   type(error_type), allocatable, intent(out) :: error
+
+   real(wp), parameter :: lat_3d(3, 3) = reshape([ &
+      & 5.0_wp, 0.5_wp, 0.0_wp, &
+      & 1.0_wp, 6.0_wp, 0.5_wp, &
+      & 0.0_wp, 1.0_wp, 7.0_wp], [3, 3])
+   real(wp), parameter :: frac_in(3) = [0.25_wp, -0.35_wp, 0.40_wp]
+   real(wp), parameter :: shifts(3) = [3.0_wp, -4.0_wp, 2.0_wp]
+   real(wp) :: inv_lat(3, 3), lat_sub(3, 3), ginv(3, 3), pinv(3, 3)
+   real(wp) :: rij(3), vec(3), ref(3), frac_out(3), empty_mat(0, 0)
+   real(wp), parameter :: frac_edge(3) = [0.5_wp, -0.5_wp, 0.2_wp]
+
+   inv_lat = matinv_3x3(lat_3d)
+
+   ! 0D molecular: returns rij unchanged even with zero-sized lattice/inv_lat
+   rij = [12.3_wp, -45.6_wp, 78.9_wp]
+   vec = wrap_displacement([.false.], empty_mat, empty_mat, rij)
+   call check(error, maxval(abs(vec - rij)) <= thr, &
+      & "0D one-element mask modified displacement")
+   if (allocated(error)) return
+
+   vec = wrap_displacement([.false., .false., .false.], lat_3d, inv_lat, rij)
+   call check(error, maxval(abs(vec - rij)) <= thr, &
+      & "0D three-element mask modified displacement")
+   if (allocated(error)) return
+
+   ! 3D triclinic cell with both three-element and one-element masks
+   ref = matmul(lat_3d, frac_in)
+   rij = matmul(lat_3d, frac_in + shifts)
+   vec = wrap_displacement([.true., .true., .true.], lat_3d, inv_lat, rij)
+   call check(error, maxval(abs(vec - ref)) <= thr, &
+      & "3D displacement not folded into [-0.5, 0.5]")
+   if (allocated(error)) return
+
+   frac_out = matmul(inv_lat, vec)
+   call check(error, all(abs(frac_out) <= 0.5_wp + thr), &
+      & "3D folded fractional coordinates outside [-0.5, 0.5]")
+   if (allocated(error)) return
+
+   vec = wrap_displacement([.true.], lat_3d, inv_lat, rij)
+   call check(error, maxval(abs(vec - ref)) <= thr, &
+      & "One-element periodic mask failed for wrap_displacement")
+   if (allocated(error)) return
+
+   ! Antisymmetry including exact half-integer fractional boundaries
+   rij = matmul(lat_3d, frac_edge + shifts)
+   vec = wrap_displacement([.true., .true., .true.], lat_3d, inv_lat, rij)
+   ref = wrap_displacement([.true., .true., .true.], lat_3d, inv_lat, -rij)
+   call check(error, maxval(abs(vec + ref)) <= thr, &
+      & "wrap_displacement is not antisymmetric at half-cell boundary")
+   if (allocated(error)) return
+
+   frac_out = matmul(inv_lat, vec)
+   call check(error, all(abs(frac_out) <= 0.5_wp + thr), &
+      & "Boundary displacement outside [-0.5, 0.5]")
+   if (allocated(error)) return
+
+   ! 2D slab: fold axes 1 and 3, leave nonperiodic axis 2 untouched
+   rij = matmul(lat_3d, frac_in + [3.0_wp, 4.7_wp, -2.0_wp])
+   ref = matmul(lat_3d, [frac_in(1), frac_in(2) + 4.7_wp, frac_in(3)])
+   vec = wrap_displacement([.true., .false., .true.], lat_3d, inv_lat, rij)
+   call check(error, maxval(abs(vec - ref)) <= thr, &
+      & "2D displacement modified nonperiodic axis")
+   if (allocated(error)) return
+
+   ! 2D slab with pseudoinverse inv_lat from get_inverse_metric
+   call get_inverse_metric([.true., .false., .true.], lat_3d, lat_sub, ginv, error)
+   if (allocated(error)) return
+   pinv = matmul(ginv, transpose(lat_sub))
+   lat_sub(:, 2) = [99.0_wp, -88.0_wp, 77.0_wp]
+   rij = 3.2_wp * lat_3d(:, 1) - 2.3_wp * lat_3d(:, 3) + [1.0_wp, 25.0_wp, -3.0_wp]
+   vec = wrap_displacement([.true., .false., .true.], lat_sub, pinv, rij)
+   frac_out = matmul(pinv, vec)
+   call check(error, abs(frac_out(1)) <= 0.5_wp + thr &
+      & .and. abs(frac_out(3)) <= 0.5_wp + thr, &
+      & "2D pseudoinverse wrap_displacement outside [-0.5, 0.5]")
+   if (allocated(error)) return
+
+   ! 1D wire: fold only axis 2
+   rij = matmul(lat_3d, frac_in + [5.2_wp, -3.0_wp, -4.1_wp])
+   ref = matmul(lat_3d, [frac_in(1) + 5.2_wp, frac_in(2), frac_in(3) - 4.1_wp])
+   vec = wrap_displacement([.false., .true., .false.], lat_3d, inv_lat, rij)
+   call check(error, maxval(abs(vec - ref)) <= thr, &
+      & "1D displacement modified nonperiodic axes")
+
+end subroutine test_wrap_displacement
+
+
+!> Wrapped lattice points cover all images within cutoff for folded displacements
+subroutine test_wrapped_lattice_points(error)
+
+   !> Error handling
+   type(error_type), allocatable, intent(out) :: error
+
+   real(wp), parameter :: lat_3d(3, 3) = reshape([ &
+      & 4.5_wp, 0.8_wp, 0.0_wp, &
+      & 0.7_wp, 5.2_wp, 0.6_wp, &
+      & 0.2_wp, 0.9_wp, 6.0_wp], [3, 3])
+   real(wp), parameter :: rcut = 8.5_wp
+   real(wp) :: inv_lat(3, 3), lat_mod(3, 3), inv_mod(3, 3), empty_mat(0, 0)
+   real(wp) :: rij(3), vec0(3), rvec(3)
+   real(wp), allocatable :: trans1(:, :), trans2(:, :)
+   integer :: rep(3), expected_n, ix, iy, iz, itr
+   logical :: found
+
+   inv_lat = matinv_3x3(lat_3d)
+
+   ! 0D molecular: single zero translation vector
+   call get_wrapped_lattice_points([.false.], empty_mat, empty_mat, rcut, trans1)
+   call check(error, size(trans1, 2) == 1 .and. maxval(abs(trans1(:, 1))) <= thr, &
+      & "0D wrapped lattice points should contain only the origin")
+   if (allocated(error)) return
+
+   ! 3D triclinic: check exact rep formula and 5-arg vs 6-arg equivalence
+   rep(1) = ceiling(rcut * norm2(inv_lat(1, :))) + 1
+   rep(2) = ceiling(rcut * norm2(inv_lat(2, :))) + 1
+   rep(3) = ceiling(rcut * norm2(inv_lat(3, :))) + 1
+   expected_n = product(2 * rep + 1)
+
+   call get_wrapped_lattice_points([.true., .true., .true.], lat_3d, inv_lat, &
+      & rcut, trans1)
+   call get_wrapped_lattice_points([.true.], lat_3d, inv_lat, rcut, trans2, error)
+   if (allocated(error)) return
+
+   call check(error, size(trans1, 2) == expected_n, &
+      & "3D wrapped lattice point count does not match rep formula")
+   if (allocated(error)) return
+
+   call check(error, same_points(trans1, trans2), &
+      & "5-arg and 6-arg wrapped lattice points differ")
+   if (allocated(error)) return
+
+   ! Completeness invariant: wrapped displacement + wrapped lattice points
+   ! finds every periodic image within rcut for arbitrary shifted displacement
+   rij = matmul(lat_3d, [2.49_wp, -3.48_wp, 1.47_wp])
+   vec0 = wrap_displacement([.true., .true., .true.], lat_3d, inv_lat, rij)
+   do ix = -rep(1) - 4, rep(1) + 4
+      do iy = -rep(2) - 4, rep(2) + 4
+         do iz = -rep(3) - 4, rep(3) + 4
+            rvec = rij + matmul(lat_3d, real([ix, iy, iz], wp))
+            if (norm2(rvec) <= rcut) then
+               found = .false.
+               do itr = 1, size(trans1, 2)
+                  if (all(abs(vec0 + trans1(:, itr) - rvec) <= thr)) then
+                     found = .true.
+                     exit
+                  end if
+               end do
+               call check(error, found, &
+                  & "Wrapped lattice points missed an image within rcut (3D)")
+               if (allocated(error)) return
+            end if
+         end do
+      end do
+   end do
+
+   ! 2D slab: nonperiodic axis has rep=0 and its lattice/inv_lat entries are ignored
+   call get_wrapped_lattice_points([.true., .false., .true.], lat_3d, inv_lat, &
+      & rcut, trans1, error)
+   if (allocated(error)) return
+
+   expected_n = (2 * rep(1) + 1) * (2 * rep(3) + 1)
+   call check(error, size(trans1, 2) == expected_n, &
+      & "2D wrapped lattice point count does not match rep formula")
+   if (allocated(error)) return
+
+   lat_mod = lat_3d
+   lat_mod(:, 2) = [100.0_wp, -200.0_wp, 300.0_wp]
+   inv_mod = inv_lat
+   inv_mod(2, :) = [999.0_wp, -888.0_wp, 777.0_wp]
+   call get_wrapped_lattice_points([.true., .false., .true.], lat_mod, inv_mod, &
+      & rcut, trans2, error)
+   if (allocated(error)) return
+
+   call check(error, same_points(trans1, trans2), &
+      & "2D wrapped lattice points used nonperiodic axis")
+   if (allocated(error)) return
+
+   ! 1D wire: only axis 2 repeated
+   call get_wrapped_lattice_points([.false., .true., .false.], lat_3d, inv_lat, &
+      & rcut, trans1, error)
+   if (allocated(error)) return
+
+   call check(error, size(trans1, 2) == 2 * rep(2) + 1, &
+      & "1D wrapped lattice point count does not match rep formula")
+   if (allocated(error)) return
+
+   ! Zero cutoff still includes +-1 along periodic axes (rep = 1)
+   call get_wrapped_lattice_points([.true., .false., .true.], lat_3d, inv_lat, &
+      & 0.0_wp, trans1, error)
+   if (allocated(error)) return
+
+   call check(error, size(trans1, 2) == 9, &
+      & "Zero-cutoff 2D wrapped lattice points should have 3x3=9 points")
+
+end subroutine test_wrapped_lattice_points
+
+
+!> Invalid cutoffs fail cleanly in get_wrapped_lattice_points
+subroutine test_wrapped_lattice_points_errors(error)
+
+   !> Error handling
+   type(error_type), allocatable, intent(out) :: error
+
+   type(error_type), allocatable :: call_err
+   real(wp), parameter :: lat(3, 3) = reshape([ &
+      & 5.0_wp, 0.0_wp, 0.0_wp, &
+      & 0.0_wp, 5.0_wp, 0.0_wp, &
+      & 0.0_wp, 0.0_wp, 5.0_wp], [3, 3])
+   real(wp) :: inv_lat(3, 3)
+   real(wp), allocatable :: trans(:, :)
+
+   inv_lat = matinv_3x3(lat)
+
+   call get_wrapped_lattice_points([.false., .false., .false.], lat, inv_lat, &
+      & -1.0_wp, trans, call_err)
+   call check(error, allocated(call_err), &
+      & "Negative cutoff accepted by get_wrapped_lattice_points")
+   if (allocated(error)) return
+
+   call get_wrapped_lattice_points([.true., .true., .true.], lat, inv_lat, &
+      & 1.0e12_wp, trans, call_err)
+   call check(error, allocated(call_err), &
+      & "Overflow cutoff accepted by get_wrapped_lattice_points")
+
+end subroutine test_wrapped_lattice_points_errors
+
+
+!> Wrapping a structure returns a wrapped copy without mutating the input
+subroutine test_wrap_structure(error)
+
+   !> Error handling
+   type(error_type), allocatable, intent(out) :: error
+
+   type(structure_type) :: mol, mol_wrapped, empty_mol
+   real(wp), allocatable :: xyz_orig(:, :), xyz_ref(:, :)
+   real(wp), parameter :: a1(3) = [4.0_wp, 3.0_wp, 0.0_wp]
+   real(wp), parameter :: a2(3) = [-3.0_wp, 4.0_wp, 5.0_wp]
+   real(wp), parameter :: normal(3) = [3.0_wp, -4.0_wp, 5.0_wp]
+   real(wp) :: lat(3, 3), slab_xyz(3, 2), slab_ref(3, 2)
+   integer :: iat
+
+   ! 3D periodic structure shifted outside central cell
+   call get_structure(mol, "x01")
+   do iat = 1, mol%nat
+      mol%xyz(:, iat) = mol%xyz(:, iat) + matmul(mol%lattice, [2.0_wp, -1.0_wp, 3.0_wp])
+   end do
+   xyz_orig = mol%xyz
+   xyz_ref = mol%xyz
+   call wrap_to_central_cell(xyz_ref, mol%lattice, mol%periodic)
+
+   call wrap_structure(mol, mol_wrapped)
+
+   call check(error, maxval(abs(mol%xyz - xyz_orig)) <= thr, &
+      & "wrap_structure mutated input coordinates")
+   if (allocated(error)) return
+
+   call check(error, maxval(abs(mol_wrapped%xyz - xyz_ref)) <= thr, &
+      & "wrap_structure coordinates do not match wrap_to_central_cell")
+   if (allocated(error)) return
+
+   call check(error, mol_wrapped%nat == mol%nat .and. mol_wrapped%nid == mol%nid &
+      & .and. all(mol_wrapped%id == mol%id) .and. all(mol_wrapped%num == mol%num) &
+      & .and. all(mol_wrapped%periodic .eqv. mol%periodic) &
+      & .and. maxval(abs(mol_wrapped%lattice - mol%lattice)) <= thr, &
+      & "wrap_structure did not preserve structure metadata")
+   if (allocated(error)) return
+
+   ! 2D slab structure: wraps only periodic axes
+   lat = 0.0_wp
+   lat(:, 1) = a1
+   lat(:, 2) = [10.0_wp, 10.0_wp, 10.0_wp]
+   lat(:, 3) = a2
+   slab_ref(:, 1) = 0.20_wp * a1 + 0.35_wp * a2 + 2.5_wp * normal
+   slab_ref(:, 2) = 0.75_wp * a1 + 0.60_wp * a2 - 4.1_wp * normal
+   slab_xyz(:, 1) = slab_ref(:, 1) + 3.0_wp * a1 - 2.0_wp * a2
+   slab_xyz(:, 2) = slab_ref(:, 2) - 4.0_wp * a1 + 5.0_wp * a2
+   call new(mol, [6, 1], slab_xyz, charge=1.0_wp, uhf=1, lattice=lat, &
+      & periodic=[.true., .false., .true.])
+   call wrap_structure(mol, mol_wrapped)
+
+   call check(error, maxval(abs(mol_wrapped%xyz - slab_ref)) <= thr &
+      & .and. abs(mol_wrapped%charge - 1.0_wp) <= thr &
+      & .and. mol_wrapped%uhf == 1, &
+      & "wrap_structure failed on 2D slab structure")
+   if (allocated(error)) return
+
+   ! 0D molecular structure: unchanged copy
+   call new(mol, [8, 1], reshape([10.0_wp, -20.0_wp, 30.0_wp, &
+      & -5.0_wp, 15.0_wp, -25.0_wp], [3, 2]))
+   call wrap_structure(mol, mol_wrapped)
+   call check(error, maxval(abs(mol_wrapped%xyz - mol%xyz)) <= thr, &
+      & "wrap_structure modified 0D molecular coordinates")
+   if (allocated(error)) return
+
+   ! Default-initialized empty structure: handled safely
+   call wrap_structure(empty_mol, mol_wrapped)
+   call check(error, mol_wrapped%nat == 0 .and. .not. allocated(mol_wrapped%xyz), &
+      & "wrap_structure failed on empty structure")
+
+end subroutine test_wrap_structure
 
 
 !> Periodic directions from full and one-element masks

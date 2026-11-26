@@ -24,11 +24,13 @@ module mctc_cutoff
    use, intrinsic :: iso_fortran_env, only : error_unit
    use mctc_env, only : wp, error_type, fatal_error
    use mctc_io_math, only : matdet_3x3, matinv_3x3
+   use mctc_io_structure, only : structure_type
    implicit none
    private
 
-   public :: get_lattice_points, get_periodic_axes, get_inverse_metric, &
-      & reduce_basis, wrap_to_central_cell
+   public :: get_lattice_points, get_wrapped_lattice_points, &
+      & get_periodic_axes, get_inverse_metric, reduce_basis, &
+      & wrap_to_central_cell, wrap_displacement, wrap_structure
 
 
    interface get_lattice_points
@@ -37,6 +39,11 @@ module mctc_cutoff
       module procedure :: get_lattice_points_rep_3d
       module procedure :: get_lattice_points_rep_3d_legacy
    end interface get_lattice_points
+
+   interface get_wrapped_lattice_points
+      module procedure :: get_wrapped_lattice_points_err
+      module procedure :: get_wrapped_lattice_points_noerr
+   end interface get_wrapped_lattice_points
 
    !> Tolerance for detecting linearly dependent periodic lattice vectors
    real(wp), parameter :: tol_deg = 1.0e-12_wp
@@ -337,6 +344,100 @@ subroutine get_lattice_points_cutoff_legacy(periodic, lat, rthr, trans)
 end subroutine get_lattice_points_cutoff_legacy
 
 
+!> Create lattice points for wrapped displacements within a given cutoff.
+!>
+!> Reuses a precomputed inverse lattice matrix to determine repetitions
+!> `ceiling(rcut * norm2(inv_lat(axis, :))) + 1` along each periodic axis.
+pure subroutine get_wrapped_lattice_points_err(periodic, lattice, inv_lat, &
+      & rcut, trans, error)
+
+   !> Periodic dimensions
+   logical, intent(in) :: periodic(:)
+
+   !> Lattice vectors
+   real(wp), intent(in) :: lattice(:, :)
+
+   !> Inverse lattice matrix (rows are reciprocal vectors)
+   real(wp), intent(in) :: inv_lat(:, :)
+
+   !> Real space cutoff
+   real(wp), intent(in) :: rcut
+
+   !> Generated lattice points
+   real(wp), allocatable, intent(out) :: trans(:, :)
+
+   !> Error handling
+   type(error_type), allocatable, intent(out) :: error
+
+   integer :: i, axis, ndim, p_axes(3), rep(3)
+   real(wp) :: lat(3, 3), extent(3)
+
+   if (.not. (rcut >= 0.0_wp)) then
+      call fatal_error(error, "Negative cutoff for lattice points")
+      return
+   end if
+
+   if (.not. any(periodic)) then
+      allocate(trans(3, 1), source=0.0_wp)
+      return
+   end if
+
+   call get_periodic_axes(periodic, ndim, p_axes)
+   lat(:, :) = 0.0_wp
+   extent(:) = 0.0_wp
+   do i = 1, ndim
+      axis = p_axes(i)
+      lat(:, axis) = lattice(:, axis)
+      extent(axis) = rcut * norm2(inv_lat(axis, :))
+   end do
+
+   if (.not. all(extent < real(huge(i) - 1, wp))) then
+      call fatal_error(error, "Number of lattice points exceeds the integer range")
+      return
+   end if
+
+   rep(:) = 0
+   do i = 1, ndim
+      axis = p_axes(i)
+      rep(axis) = ceiling(extent(axis)) + 1
+   end do
+
+   call get_lattice_points_rep_3d(lat, rep, .true., trans, error)
+
+end subroutine get_wrapped_lattice_points_err
+
+
+!> Create lattice points for wrapped displacements within a given cutoff.
+subroutine get_wrapped_lattice_points_noerr(periodic, lattice, inv_lat, &
+      & rcut, trans)
+
+   !> Periodic dimensions
+   logical, intent(in) :: periodic(:)
+
+   !> Lattice vectors
+   real(wp), intent(in) :: lattice(:, :)
+
+   !> Inverse lattice matrix (rows are reciprocal vectors)
+   real(wp), intent(in) :: inv_lat(:, :)
+
+   !> Real space cutoff
+   real(wp), intent(in) :: rcut
+
+   !> Generated lattice points
+   real(wp), allocatable, intent(out) :: trans(:, :)
+
+   type(error_type), allocatable :: error
+
+   call get_wrapped_lattice_points_err(periodic, lattice, inv_lat, rcut, &
+      & trans, error)
+   if (allocated(error)) then
+      write(error_unit, "(a)") error%message
+      error stop
+   end if
+
+end subroutine get_wrapped_lattice_points_noerr
+
+
 !> Wrap Cartesian coordinates into the central cell along the periodic
 !> directions, the components perpendicular to the periodic subspace are kept.
 pure subroutine wrap_to_central_cell(xyz, lattice, periodic)
@@ -366,6 +467,59 @@ pure subroutine wrap_to_central_cell(xyz, lattice, periodic)
    end do
 
 end subroutine wrap_to_central_cell
+
+
+!> Fold a Cartesian displacement into fractional [-0.5, 0.5] along periodic axes
+pure function wrap_displacement(periodic, lattice, inv_lat, rij) result(vec)
+
+   !> Periodic dimensions
+   logical, intent(in) :: periodic(:)
+
+   !> Lattice vectors
+   real(wp), intent(in) :: lattice(:, :)
+
+   !> Inverse lattice matrix (rows are reciprocal vectors)
+   real(wp), intent(in) :: inv_lat(:, :)
+
+   !> Cartesian displacement vector
+   real(wp), intent(in) :: rij(3)
+
+   !> Folded Cartesian displacement vector
+   real(wp) :: vec(3)
+
+   integer :: i, axis, ndim, p_axes(3)
+   real(wp) :: frac
+
+   vec(:) = rij
+   call get_periodic_axes(periodic, ndim, p_axes)
+   do i = 1, ndim
+      axis = p_axes(i)
+      frac = dot_product(inv_lat(axis, :), rij)
+      vec(:) = vec - anint(frac) * lattice(:, axis)
+   end do
+
+end function wrap_displacement
+
+
+!> Return a copy of a structure with coordinates wrapped into the central cell
+pure subroutine wrap_structure(mol, mol_wrapped)
+
+   !> Molecular structure data
+   type(structure_type), intent(in) :: mol
+
+   !> Wrapped copy of the molecular structure
+   type(structure_type), intent(out) :: mol_wrapped
+
+   mol_wrapped = mol
+   if (allocated(mol_wrapped%xyz) .and. allocated(mol_wrapped%lattice) &
+      & .and. allocated(mol_wrapped%periodic)) then
+      if (any(mol_wrapped%periodic)) then
+         call wrap_to_central_cell(mol_wrapped%xyz, mol_wrapped%lattice, &
+            & mol_wrapped%periodic)
+      end if
+   end if
+
+end subroutine wrap_structure
 
 
 !> Shift a fractional coordinate into the half-open unit interval [0, 1)
